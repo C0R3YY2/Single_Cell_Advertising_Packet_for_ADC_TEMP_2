@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <style name="Theme.Single_Cell_Advertising_Packet_for_ADC_TEMP_2" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>
