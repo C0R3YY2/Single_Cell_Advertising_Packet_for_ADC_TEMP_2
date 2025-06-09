@@ -36,6 +36,11 @@ import androidx.compose.ui.unit.sp
 import androidx.core.app.ActivityCompat
 import com.example.single_cell_advertising_packet_for_adc_temp_2.ui.theme.Single_Cell_Advertising_Packet_for_ADC_TEMP_2Theme
 
+
+import android.bluetooth.le.ScanFilter ////////////////////
+import android.bluetooth.le.ScanSettings ////////////////////
+
+
 // Data class to hold the state for each device
 data class DeviceState(
     val label: String,
@@ -96,7 +101,7 @@ class MainActivity : ComponentActivity() {
         // Convert to voltage (in volts)
         val voltageInVolts = adcValue / 1000.0 * (178.0 + 150.0) / (150.0)
 
-        return String.format("%.2fV", voltageInVolts)
+        return String.format("%.3fV", voltageInVolts)
     }
 
     private fun convertToTemperature(bytes: List<Byte>): String {
@@ -229,12 +234,32 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startScan() {
-        if (ActivityCompat.checkSelfPermission(
+        /*if (ActivityCompat.checkSelfPermission(
                 this,
                 Manifest.permission.BLUETOOTH_SCAN
             ) == PackageManager.PERMISSION_GRANTED
         ) {
             bluetoothAdapter?.bluetoothLeScanner?.startScan(scanCallback)
+        }*/
+
+        if (
+            ActivityCompat.checkSelfPermission(
+                this,
+                Manifest.permission.BLUETOOTH_SCAN
+            ) == PackageManager.PERMISSION_GRANTED
+        ) {
+            val scanner = bluetoothAdapter?.bluetoothLeScanner ?: return
+
+            val filters = targetDevices.keys.map { address ->
+                ScanFilter.Builder().setDeviceAddress(address).build()
+            }
+
+            val settings = ScanSettings.Builder()
+                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                .setReportDelay(0)
+                .build()
+
+            scanner.startScan(filters, settings, scanCallback)
         }
     }
 
