@@ -40,6 +40,9 @@ import com.example.single_cell_advertising_packet_for_adc_temp_2.ui.theme.Single
 import android.bluetooth.le.ScanFilter ////////////////////
 import android.bluetooth.le.ScanSettings ////////////////////
 
+import androidx.lifecycle.lifecycleScope ////////////////////
+import kotlinx.coroutines.flow.MutableSharedFlow ////////////////////
+import kotlinx.coroutines.launch ////////////////////
 
 // Data class to hold the state for each device
 data class DeviceState(
@@ -118,17 +121,20 @@ class MainActivity : ComponentActivity() {
         return String.format("%.2f°C", tempCelsius)
     }
 
+    private val scanResults = MutableSharedFlow<ScanResult>(extraBufferCapacity = 64) ///////////////
+
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
+            /*
             val deviceAddress = result.device.address
             // Check if the scanned device is one of our targets
             if (deviceAddress in targetDevices.keys) {
                 val bytes = result.scanRecord?.bytes ?: return
                 val firstSixBytes = bytes.take(6)
-                val hex = firstSixBytes.joinToString(" ") { String.format("%02X", it) }
+                val hex = firstSixBytes.joinToString(" ") { String.format("%02X", it) }*/
 
                 // Get the state for the specific device and update it
-                deviceStates[deviceAddress]?.let { currentState ->
+                /*deviceStates[deviceAddress]?.let { currentState ->
                     val newState = currentState.copy(
                         adcValue = convertAdcToVoltage(firstSixBytes),
                         tempValue = convertToTemperature(firstSixBytes)
@@ -139,16 +145,65 @@ class MainActivity : ComponentActivity() {
                     advertisingPackets.add("[${currentState.label}] $hex")
 
                     if (advertisingPackets.size > maxEntries * targetDevices.size) { // Adjust log size
-                        advertisingPackets.removeAt(0)
+                        advertisingPackets.removeAt(0)*/
+
+                // All state mutations must happen on the main thread because
+                // snapshot state used by Compose is not thread-safe.
+                /*this@MainActivity.runOnUiThread {
+                    deviceStates[deviceAddress]?.let { currentState ->
+                        val newState = currentState.copy(
+                            adcValue = convertAdcToVoltage(firstSixBytes),
+                            tempValue = convertToTemperature(firstSixBytes)
+                        )
+                        deviceStates[deviceAddress] = newState
+
+                        // Add labeled raw data to the log
+                        advertisingPackets.add("[${currentState.label}] $hex")
+
+                        if (advertisingPackets.size > maxEntries * targetDevices.size) { // Adjust log size
+                            advertisingPackets.removeAt(0)
+                        }
+
                     }
                 }
-            }
+            }*/
+
+            scanResults.tryEmit(result)
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+
+        // Process scan results on the main thread using a coroutine. This
+        // avoids posting a runnable for every callback invocation, which can
+        // lead to bursts when the UI thread is busy.
+        lifecycleScope.launch {
+            scanResults.collect { result ->
+                val deviceAddress = result.device.address
+                if (deviceAddress in targetDevices.keys) {
+                    val bytes = result.scanRecord?.bytes ?: return@collect
+                    val firstSixBytes = bytes.take(6)
+                    val hex = firstSixBytes.joinToString(" ") { String.format("%02X", it) }
+
+                    deviceStates[deviceAddress]?.let { currentState ->
+                        val newState = currentState.copy(
+                            adcValue = convertAdcToVoltage(firstSixBytes),
+                            tempValue = convertToTemperature(firstSixBytes)
+                        )
+                        deviceStates[deviceAddress] = newState
+
+                        // Add labeled raw data to the log
+                        advertisingPackets.add("[${currentState.label}] $hex")
+
+                        if (advertisingPackets.size > maxEntries * targetDevices.size) {
+                            advertisingPackets.removeAt(0)
+                        }
+                    }
+                }
+            }
+        }
 
         // Initialize the state map for all target devices
         targetDevices.forEach { (address, label) ->
