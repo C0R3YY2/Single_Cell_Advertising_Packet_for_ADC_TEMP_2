@@ -1,66 +1,62 @@
 package com.example.single_cell_advertising_packet_for_adc_temp_2
 
+/*  UI & analytics layer — unchanged except that
+ *  (a) it no longer starts/stops the scan itself,
+ *  (b) it consumes results from BleScannerBus.
+ */
+
 import android.Manifest
-import android.bluetooth.BluetoothAdapter
-import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanResult
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.MaterialTheme
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material3.Button
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.mutableStateListOf
-import androidx.compose.runtime.mutableStateMapOf
-import androidx.compose.runtime.remember
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.app.ActivityCompat
+import androidx.lifecycle.lifecycleScope
 import com.example.single_cell_advertising_packet_for_adc_temp_2.ui.theme.Single_Cell_Advertising_Packet_for_ADC_TEMP_2Theme
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
 
+/* ---------- domain models ---------- */
 
-import android.bluetooth.le.ScanFilter ////////////////////
-import android.bluetooth.le.ScanSettings ////////////////////
+enum class DisplayMode { FULL, TEMPERATURE, VOLTAGE, TIME }
 
-import androidx.lifecycle.lifecycleScope ////////////////////
-import kotlinx.coroutines.flow.MutableSharedFlow ////////////////////
-import kotlinx.coroutines.launch ////////////////////
-
-// Data class to hold the state for each device
 data class DeviceState(
     val label: String,
     var adcValue: String = "--",
-    var tempValue: String = "--"
+    var rawVoltage: Double = 0.0,
+    var tempValue: String = "--",
+    var rawTemp: Double = 0.0,
+    var timeDeltaMs: Long = 0L,
+    var lastPacketTimestamp: Long = 0L
 )
+
+/* ---------- main activity ---------- */
 
 class MainActivity : ComponentActivity() {
 
-    private val advertisingPackets = mutableStateListOf<String>()
-    private val maxEntries = 20 // Max entries for the raw data log
-
-    // A map to hold the state for each target device, keyed by its MAC address.
-    // Using mutableStateMapOf to ensure Compose recomposes when items are updated.
-    private val deviceStates = mutableStateMapOf<String, DeviceState>()
-
-    // Map of target BLE device addresses to their assigned labels
     private val targetDevices = mapOf(
         "58:35:0F:DC:8D:BB" to "1",
         "58:35:0F:DC:8D:A9" to "2",
@@ -70,324 +66,147 @@ class MainActivity : ComponentActivity() {
         "58:35:0F:DC:8D:C7" to "6"
     )
 
-    private val bluetoothAdapter: BluetoothAdapter? by lazy { BluetoothAdapter.getDefaultAdapter() }
-    private val permissionsLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
-            if (results.values.all { it }) {
-                startScan()
-            }
+    private val deviceStates = mutableStateMapOf<String, DeviceState>()
+    private val lastPacketTimestamps = mutableMapOf<String, Long>()
+
+    /* ---------- permissions ---------- */
+
+    private val permissionsLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { granted ->
+        if (granted.values.all { it }) startScannerService()
+    }
+
+    private fun allPermissionsGranted() =
+        listOf(
+            Manifest.permission.BLUETOOTH_SCAN,
+            Manifest.permission.BLUETOOTH_CONNECT,
+            Manifest.permission.ACCESS_FINE_LOCATION
+        ).all { perm ->
+            ActivityCompat.checkSelfPermission(this, perm) == PackageManager.PERMISSION_GRANTED
         }
 
-    private fun arePermissionsGranted(): Boolean {
-        return ActivityCompat.checkSelfPermission(
-            this,
-            Manifest.permission.BLUETOOTH_SCAN
-        ) == PackageManager.PERMISSION_GRANTED &&
-                ActivityCompat.checkSelfPermission(
-                    this,
-                    Manifest.permission.BLUETOOTH_CONNECT
-                ) == PackageManager.PERMISSION_GRANTED &&
-                ActivityCompat.checkSelfPermission(
-                    this,
-                    Manifest.permission.ACCESS_FINE_LOCATION
-                ) == PackageManager.PERMISSION_GRANTED
-    }
-
-    private fun convertAdcToVoltage(bytes: List<Byte>): String {
-        // First two bytes (e.g., 0x06D0) represent the ADC value
-        val adcMsb = bytes[0].toInt() and 0xFF
-        val adcLsb = bytes[1].toInt() and 0xFF
-
-        // Combine bytes to get 16-bit value (big-endian format)
-        val adcValue = (adcMsb shl 8) or adcLsb
-
-        // Convert to voltage (in volts)
-        val voltageInVolts = adcValue / 1000.0 * (178.0 + 150.0) / (150.0)
-
-        return String.format("%.3fV", voltageInVolts)
-    }
-
-    private fun convertToTemperature(bytes: List<Byte>): String {
-        // Next two bytes (e.g., 0x6750) represent the temperature value
-        val tempMsb = bytes[2].toInt() and 0xFF
-        val tempLsb = bytes[3].toInt() and 0xFF
-
-        // Combine bytes to get 16-bit value (big-endian format)
-        val tempValue = (tempMsb shl 8) or tempLsb
-
-        // Apply temperature conversion formula
-        val tempCelsius = -45.0 + (175.0 * tempValue / 65535.0)
-
-        return String.format("%.2f°C", tempCelsius)
-    }
-
-    private val scanResults = MutableSharedFlow<ScanResult>(extraBufferCapacity = 64) ///////////////
-
-    private val scanCallback = object : ScanCallback() {
-        override fun onScanResult(callbackType: Int, result: ScanResult) {
-            /*
-            val deviceAddress = result.device.address
-            // Check if the scanned device is one of our targets
-            if (deviceAddress in targetDevices.keys) {
-                val bytes = result.scanRecord?.bytes ?: return
-                val firstSixBytes = bytes.take(6)
-                val hex = firstSixBytes.joinToString(" ") { String.format("%02X", it) }*/
-
-                // Get the state for the specific device and update it
-                /*deviceStates[deviceAddress]?.let { currentState ->
-                    val newState = currentState.copy(
-                        adcValue = convertAdcToVoltage(firstSixBytes),
-                        tempValue = convertToTemperature(firstSixBytes)
-                    )
-                    deviceStates[deviceAddress] = newState
-
-                    // Add labeled raw data to the log
-                    advertisingPackets.add("[${currentState.label}] $hex")
-
-                    if (advertisingPackets.size > maxEntries * targetDevices.size) { // Adjust log size
-                        advertisingPackets.removeAt(0)*/
-
-                // All state mutations must happen on the main thread because
-                // snapshot state used by Compose is not thread-safe.
-                /*this@MainActivity.runOnUiThread {
-                    deviceStates[deviceAddress]?.let { currentState ->
-                        val newState = currentState.copy(
-                            adcValue = convertAdcToVoltage(firstSixBytes),
-                            tempValue = convertToTemperature(firstSixBytes)
-                        )
-                        deviceStates[deviceAddress] = newState
-
-                        // Add labeled raw data to the log
-                        advertisingPackets.add("[${currentState.label}] $hex")
-
-                        if (advertisingPackets.size > maxEntries * targetDevices.size) { // Adjust log size
-                            advertisingPackets.removeAt(0)
-                        }
-
-                    }
-                }
-            }*/
-
-            scanResults.tryEmit(result)
-        }
-    }
+    /* ---------- lifecycle ---------- */
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        // Process scan results on the main thread using a coroutine. This
-        // avoids posting a runnable for every callback invocation, which can
-        // lead to bursts when the UI thread is busy.
-        lifecycleScope.launch {
-            scanResults.collect { result ->
-                val deviceAddress = result.device.address
-                if (deviceAddress in targetDevices.keys) {
-                    val bytes = result.scanRecord?.bytes ?: return@collect
-                    val firstSixBytes = bytes.take(6)
-                    val hex = firstSixBytes.joinToString(" ") { String.format("%02X", it) }
-
-                    deviceStates[deviceAddress]?.let { currentState ->
-                        val newState = currentState.copy(
-                            adcValue = convertAdcToVoltage(firstSixBytes),
-                            tempValue = convertToTemperature(firstSixBytes)
-                        )
-                        deviceStates[deviceAddress] = newState
-
-                        // Add labeled raw data to the log
-                        advertisingPackets.add("[${currentState.label}] $hex")
-
-                        if (advertisingPackets.size > maxEntries * targetDevices.size) {
-                            advertisingPackets.removeAt(0)
-                        }
-                    }
-                }
-            }
+        // initialise state map
+        targetDevices.forEach { (addr, label) ->
+            deviceStates[addr] = DeviceState(label, lastPacketTimestamp = System.currentTimeMillis())
         }
 
-        // Initialize the state map for all target devices
-        targetDevices.forEach { (address, label) ->
-            deviceStates[address] = DeviceState(label)
-        }
-
-        if (arePermissionsGranted()) {
-            startScan()
-        } else {
-            permissionsLauncher.launch(
-                arrayOf(
-                    Manifest.permission.BLUETOOTH_SCAN,
-                    Manifest.permission.BLUETOOTH_CONNECT,
-                    Manifest.permission.ACCESS_FINE_LOCATION
-                )
+        if (allPermissionsGranted()) startScannerService() else permissionsLauncher.launch(
+            arrayOf(
+                Manifest.permission.BLUETOOTH_SCAN,
+                Manifest.permission.BLUETOOTH_CONNECT,
+                Manifest.permission.ACCESS_FINE_LOCATION
             )
-        }
+        )
 
-        /*setContent {
-            Single_Cell_Advertising_Packet_for_ADC_TEMP_2Theme {
-                Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-                    Column(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .padding(innerPadding)
-                            .padding(top = 16.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
-                    ) {
-                        // Get the list of devices, sorted by label for a consistent order
-                        val sortedDeviceList = remember(deviceStates) {
-                            deviceStates.values.sortedBy { it.label.toInt() }
-                        }
+        /* collect scan‑results coming from the foreground service */
+        lifecycleScope.launch {
+            BleScannerBus.scanResults.collectLatest { result ->
+                val mac = result.device.address
+                if (mac !in targetDevices) return@collectLatest // ⑤ filter in software
 
-                        // Display the list of devices and their data
-                        DeviceDataTable(devices = sortedDeviceList)
+                val now      = System.currentTimeMillis()
+                val deltaMs  = now - (lastPacketTimestamps[mac] ?: now)
+                lastPacketTimestamps[mac] = now
 
-                        // Display raw advertising data
-                        Text(
-                            text = "Raw Data Log:",
-                            style = MaterialTheme.typography.titleMedium,
-                            modifier = Modifier.padding(top = 24.dp, bottom = 4.dp)
-                        )
-                        AdvertisingList(
-                            packets = advertisingPackets,
-                            modifier = Modifier.weight(1f)
-                        )
-                    }
+                val bytes           = result.scanRecord?.bytes ?: return@collectLatest
+                val firstSix        = bytes.take(6)
+                val (voltStr, rawV) = convertAdcToVoltage(firstSix)
+                val (tmpStr, rawT)  = convertToTemperature(firstSix)
+
+                deviceStates[mac]?.let { cur ->
+                    deviceStates[mac] = cur.copy(
+                        adcValue   = voltStr,
+                        rawVoltage = rawV,
+                        tempValue  = tmpStr,
+                        rawTemp    = rawT,
+                        timeDeltaMs = deltaMs,
+                        lastPacketTimestamp = now
+                    )
                 }
             }
-        }*/
+        }
+
+        /* ---------- UI ---------- */
 
         setContent {
             Single_Cell_Advertising_Packet_for_ADC_TEMP_2Theme {
-                Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
+                var displayMode by remember { mutableStateOf(DisplayMode.FULL) }
+
+                Scaffold(modifier = Modifier.fillMaxSize()) { inner ->
                     Column(
                         modifier = Modifier
                             .fillMaxSize()
-                            .padding(innerPadding)
-                            .padding(top = 16.dp),
+                            .background(Color.White)
+                            .padding(inner)
+                            .padding(16.dp),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        // FIX: Remove the 'remember' block to ensure the list is always fresh.
-                        // The list is re-sorted on each recomposition, which is fine for a small list.
-                        val sortedDeviceList = deviceStates.values.sortedBy { it.label.toInt() }
+                        /* title */
+                        Column(horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier.padding(bottom = 16.dp)) {
+                            Text("Module ID:", fontSize = 24.sp, color = Color.Black)
+                            Text("1A5F", fontSize = 32.sp, fontWeight = FontWeight.Bold, color = Color.Black)
+                        }
 
-                        // Display the list of devices and their data
-                        DeviceDataTable(devices = sortedDeviceList)
+                        /* grid */
+                        val sorted = deviceStates.values.sortedBy { it.label.toInt() }
+                        LazyVerticalGrid(
+                            columns = GridCells.Fixed(2),
+                            contentPadding = PaddingValues(8.dp),
+                            horizontalArrangement = Arrangement.spacedBy(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(16.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable(
+                                    interactionSource = remember { MutableInteractionSource() },
+                                    indication = null
+                                ) { displayMode = DisplayMode.FULL }
+                        ) {
+                            items(sorted) { dev ->
+                                DeviceCircle(dev, displayMode)
+                            }
+                        }
 
-                        // Display raw advertising data
-                        Text(
-                            text = "Raw Data Log:",
-                            style = MaterialTheme.typography.titleMedium,
-                            modifier = Modifier.padding(top = 24.dp, bottom = 4.dp)
-                        )
-                        AdvertisingList(
-                            packets = advertisingPackets,
-                            modifier = Modifier.weight(1f)
-                        )
+                        /* bottom buttons */
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .padding(top = 16.dp),
+                            horizontalArrangement = Arrangement.SpaceEvenly
+                        ) {
+                            Button({ displayMode = DisplayMode.TEMPERATURE }) { Text("Temperature") }
+                            Button({ displayMode = DisplayMode.VOLTAGE })     { Text("Voltage") }
+                            Button({ displayMode = DisplayMode.TIME })        { Text("Time") }
+                        }
                     }
                 }
             }
-        }
-    }
-
-    private fun startScan() {
-        /*if (ActivityCompat.checkSelfPermission(
-                this,
-                Manifest.permission.BLUETOOTH_SCAN
-            ) == PackageManager.PERMISSION_GRANTED
-        ) {
-            bluetoothAdapter?.bluetoothLeScanner?.startScan(scanCallback)
-        }*/
-
-        if (
-            ActivityCompat.checkSelfPermission(
-                this,
-                Manifest.permission.BLUETOOTH_SCAN
-            ) == PackageManager.PERMISSION_GRANTED
-        ) {
-            val scanner = bluetoothAdapter?.bluetoothLeScanner ?: return
-
-            val filters = targetDevices.keys.map { address ->
-                ScanFilter.Builder().setDeviceAddress(address).build()
-            }
-
-            val settings = ScanSettings.Builder()
-                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-                .setReportDelay(0)
-                .build()
-
-            scanner.startScan(filters, settings, scanCallback)
-        }
-    }
-
-    private fun stopScan() {
-        if (ActivityCompat.checkSelfPermission(
-                this,
-                Manifest.permission.BLUETOOTH_SCAN
-            ) == PackageManager.PERMISSION_GRANTED
-        ) {
-            bluetoothAdapter?.bluetoothLeScanner?.stopScan(scanCallback)
         }
     }
 
     override fun onDestroy() {
-        stopScan()
+        stopService(Intent(this, ForegroundScannerService::class.java))
         super.onDestroy()
     }
-}
 
-@Composable
-fun DeviceDataTable(devices: List<DeviceState>, modifier: Modifier = Modifier) {
-    LazyColumn(modifier = modifier) {
-        items(devices) { device ->
-            DeviceDataCard(device = device)
-        }
+    /* ---------- small helpers (unchanged) ---------- */
+
+    private fun convertAdcToVoltage(bytes: List<Byte>) = run {
+        val adc = ((bytes[0].toInt() and 0xFF) shl 8) or (bytes[1].toInt() and 0xFF)
+        val v   = adc / 1000.0 * (178.0 + 150.0) / 150.0
+        String.format("%.3f V", v) to v
     }
-}
 
-@Composable
-fun DeviceDataCard(device: DeviceState) {
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 6.dp),
-        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Text(
-                text = "Device ${device.label}",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.Bold
-            )
-            Column(horizontalAlignment = Alignment.End) {
-                Text(
-                    text = device.adcValue,
-                    style = MaterialTheme.typography.bodyLarge
-                )
-                Text(
-                    text = device.tempValue,
-                    style = MaterialTheme.typography.bodyLarge
-                )
-            }
-        }
-    }
-}
-
-@Composable
-fun AdvertisingList(packets: List<String>, modifier: Modifier = Modifier) {
-    LazyColumn(modifier = modifier.fillMaxSize().padding(horizontal=16.dp)) {
-        items(packets) { packet ->
-            Text(
-                text = packet,
-                style = MaterialTheme.typography.bodySmall.copy(fontSize = 10.sp),
-                fontFamily = FontFamily.Monospace,
-                maxLines = 1,
-                softWrap = false
-            )
-        }
+    private fun convertToTemperature(bytes: List<Byte>) = run {
+        val raw  = ((bytes[2].toInt() and 0xFF) shl 8) or (bytes[3].toInt() and 0xFF)
+        val c    = -45.0 + 175.0 * raw / 65535.0
+        String.format("%.2f°C", c) to c
     }
 }
