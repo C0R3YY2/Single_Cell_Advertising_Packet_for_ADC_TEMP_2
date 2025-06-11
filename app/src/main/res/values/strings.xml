@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">Multi Cell</string>
+    <string name="scanner_notification_title">Multi Cell Scanner</string>
 </resources>
