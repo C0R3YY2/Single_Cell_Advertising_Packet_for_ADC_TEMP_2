@@ -3,12 +3,9 @@ package com.example.single_cell_advertising_packet_for_adc_temp_2
 import android.Manifest
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
-import android.bluetooth.le.ScanSettings
 import android.content.pm.PackageManager
 import android.os.Bundle
-import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -56,6 +53,10 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.launch
 
+
+import android.bluetooth.le.ScanFilter
+import android.bluetooth.le.ScanSettings
+
 // Enum to manage the display state of the circles
 enum class DisplayMode {
     FULL,
@@ -78,17 +79,10 @@ data class DeviceState(
 
 class MainActivity : ComponentActivity() {
 
-    // --- Robust Scanning Strategy ---
-    // Restart scan every 4 minutes to prevent Android from downgrading it to opportunistic mode.
+    // Interval after which scanning is restarted to avoid system throttling
     private val SCAN_RESTART_INTERVAL_MS = 4 * 60 * 1000L
 
-    // Rate-limiting to avoid BLE stack throttling (max 5 starts in 30s). We use 4 to be safe.
-    private val scanStartTimestamps = mutableListOf<Long>()
-    private val MAX_SCANS_IN_WINDOW = 4
-    private val SCAN_WINDOW_MS = 30_000L
-
     private var scanRestartJob: Job? = null
-    // --- End Scanning Strategy ---
 
     // A map to hold the state for each target device, keyed by its MAC address.
     private val deviceStates = mutableStateMapOf<String, DeviceState>()
@@ -113,23 +107,6 @@ class MainActivity : ComponentActivity() {
                 startScan()
             }
         }
-
-    private val scanFilters: List<ScanFilter> by lazy {
-        targetDevices.keys.map { address ->
-            ScanFilter.Builder().setDeviceAddress(address).build()
-        }
-    }
-
-    private val scanSettings: ScanSettings by lazy {
-        ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-            .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
-            .setMatchMode(ScanSettings.MATCH_MODE_AGGRESSIVE)
-            .setNumOfMatches(ScanSettings.MATCH_NUM_MAX_ADVERTISEMENT)
-            .setReportDelay(0)
-            .setLegacy(true) // Keeps scan running in the foreground on modern Android
-            .build()
-    }
 
     private fun arePermissionsGranted(): Boolean {
         return ActivityCompat.checkSelfPermission(
@@ -318,47 +295,62 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun canStartScan(): Boolean {
-        val now = System.currentTimeMillis()
-        // Remove timestamps older than the rate-limit window.
-        scanStartTimestamps.removeAll { now - it > SCAN_WINDOW_MS }
-        // If we have made too many calls recently, deny the request.
-        if (scanStartTimestamps.size >= MAX_SCANS_IN_WINDOW) {
-            Log.w("MainActivity", "BLE scan throttled. Too many start requests in the last 30 seconds.")
-            return false
-        }
-        return true
-    }
-
     private fun startScan() {
-        if (!canStartScan()) {
-            return // Throttled
-        }
+        if (
+            ActivityCompat.checkSelfPermission(
+                this,
+                Manifest.permission.BLUETOOTH_SCAN
+            ) == PackageManager.PERMISSION_GRANTED
+        ) {
+            val scanner = bluetoothAdapter?.bluetoothLeScanner ?: return
 
-        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
-            return // Permissions not granted
-        }
+            val filters = targetDevices.keys.map { address ->
+                ScanFilter.Builder().setDeviceAddress(address).build()
+            }
 
-        // Record the timestamp of this scan start.
-        scanStartTimestamps.add(System.currentTimeMillis())
+            val settings = ScanSettings.Builder()
+                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                .setReportDelay(0)
+                .build()
 
-        // Start the actual hardware scan.
-        bluetoothAdapter?.bluetoothLeScanner?.startScan(scanFilters, scanSettings, scanCallback)
+            scanner.startScan(filters, settings, scanCallback)
 
-        // Cancel any existing restart job and schedule a new one.
-        scanRestartJob?.cancel()
-        scanRestartJob = lifecycleScope.launch {
-            delay(SCAN_RESTART_INTERVAL_MS)
-            restartScan()
+            // Periodically restart scanning
+            scanRestartJob?.cancel()
+            scanRestartJob = lifecycleScope.launch {
+                delay(SCAN_RESTART_INTERVAL_MS)
+                restartScan()
+            }
         }
     }
 
     private fun restartScan() {
-        lifecycleScope.launch {
-            stopScan()
-            // A brief delay ensures the BLE stack has time to cleanly stop the previous scan.
-            delay(500)
-            startScan()
+        if (
+            ActivityCompat.checkSelfPermission(
+                this,
+                Manifest.permission.BLUETOOTH_SCAN
+            ) == PackageManager.PERMISSION_GRANTED
+        ) {
+            val scanner = bluetoothAdapter?.bluetoothLeScanner ?: return
+            scanner.stopScan(scanCallback)
+
+            val filters = targetDevices.keys.map { address ->
+                ScanFilter.Builder().setDeviceAddress(address).build()
+            }
+
+            val settings = ScanSettings.Builder()
+                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                .setReportDelay(0)
+                .build()
+
+            scanner.startScan(filters, settings, scanCallback)
+
+            // Schedule the next restart
+            scanRestartJob?.cancel()
+            scanRestartJob = lifecycleScope.launch {
+                delay(SCAN_RESTART_INTERVAL_MS)
+                restartScan()
+            }
         }
     }
 
@@ -369,14 +361,16 @@ class MainActivity : ComponentActivity() {
             ) == PackageManager.PERMISSION_GRANTED
         ) {
             bluetoothAdapter?.bluetoothLeScanner?.stopScan(scanCallback)
+            scanRestartJob?.cancel()
         }
-        // Always cancel any pending restart job when we explicitly stop scanning.
-        scanRestartJob?.cancel()
     }
 
+
+
     override fun onDestroy() {
-        super.onDestroy()
         stopScan()
+        scanRestartJob?.cancel()
+        super.onDestroy()
     }
 }
 
